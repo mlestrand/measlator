@@ -1,6 +1,7 @@
 # imports 
 import pandas as pd
 import numpy as np
+import matplotlib as plt
 
 
 # 1. set parameters (beta, gamma, etc.)
@@ -44,7 +45,7 @@ DEFAULT_MSP_PARAMS: MeaslesParameters = \
         'vaccine_efficacy': 0.997,  # 1.0 means perfect protection
         'school_contacts': 5.63424,
         'other_contacts': 2.2823,
-        'population': [500],
+        'population': [500], 
         'I0': [1],
         'vax_prop': [0.85],  # number between 0 and 1
         'threshold_values': [10],  # outbreak threshold, only first value used for now
@@ -64,7 +65,7 @@ class MetapopSEIR:
     def __init__(self,
                  params: MeaslesParameters):
         """
-        Initialize metapopulation SEPIR model
+        Initialize metapopulation SEIR model
 
         Parameters:
         params: MeaslesParameters instance with disease parameters and movement rates
@@ -102,11 +103,6 @@ class MetapopSEIR:
         self.beta = beta  # transmission rate
         self.sigma = 1.0 / params["incubation_period"]  # rate of progression from E to I
         self.gamma = 1.0 / params["infectious_period"]  # recovery rate
-        self.sigma_vax = 1.0 / params["incubation_period_vaccinated"]  # rate of progression from E to I for vaccinated
-        self.gamma_vax = 1.0 / params["infectious_period_vaccinated"]  # recovery rate for vaccinated
-
-        self.beta_vax = params['relative_infectiousness_vaccinated'] * params['R0'] / \
-                        (params["infectious_period_vaccinated"] * self.total_contacts)
         self.vaccine_efficacy = params['vaccine_efficacy']
 
         # Time array
@@ -115,41 +111,28 @@ class MetapopSEIR:
         self.params = params
 
         # Initialize compartments as 2D arrays [time_step, population]
-        self.S_unvax = np.zeros((self.n_steps, self.n_pop))
-        self.E_unvax = np.zeros((self.n_steps, self.n_pop))
-        self.I_unvax = np.zeros((self.n_steps, self.n_pop))
-        self.R_unvax = np.zeros((self.n_steps, self.n_pop))
+        self.S = np.zeros((self.n_steps, self.n_pop))
+        self.E = np.zeros((self.n_steps, self.n_pop))
+        self.I = np.zeros((self.n_steps, self.n_pop))
+        self.R = np.zeros((self.n_steps, self.n_pop))
+        self.V = np.zeros((self.n_steps, self.n_pop))
 
-        self.S_vax = np.zeros((self.n_steps, self.n_pop))  # vaccinated
-        self.E_vax = np.zeros((self.n_steps, self.n_pop))  # vaccinated breakthrough infections
-        self.I_vax = np.zeros((self.n_steps, self.n_pop))  # vaccinated breakthrough infections
-        self.R_vax = np.zeros((self.n_steps, self.n_pop))  # vaccinated breakthrough infections
-
-        self.S_unvax_to_E_unvax = np.zeros((self.n_steps, self.n_pop))
-        self.S_vax_to_E_vax = np.zeros((self.n_steps, self.n_pop))
+        self.S_to_E = np.zeros((self.n_steps, self.n_pop))
 
         # Add storage of transition variables
         if self.save_all_transitions:
 
-            self.E_unvax_to_I_unvax = np.zeros((self.n_steps, self.n_pop))
-            self.I_unvax_to_R_unvax = np.zeros((self.n_steps, self.n_pop))
-
-            self.E_vax_to_I_vax = np.zeros((self.n_steps, self.n_pop))
-            self.I_vax_to_R_vax = np.zeros((self.n_steps, self.n_pop))
+            self.E_to_I = np.zeros((self.n_steps, self.n_pop))
+            self.I_to_R = np.zeros((self.n_steps, self.n_pop))
 
         params = self.params
         N = self.N
 
-        self.I_unvax[0] = np.array(params['I0'])
-        self.S_vax[0] = [
-            int(self.N[i_pop] * params['vax_prop'][i_pop])
-            for i_pop in range(self.n_pop)
-        ]
-        self.S_unvax[0] = [
-            min(self.S_unvax[0, i_pop], self.N[i_pop] - self.I_unvax[0, i_pop])
-            for i_pop in range(self.n_pop)
-        ]
-        self.S_unvax[0] = self.N - self.I_unvax[0] - self.S_vax[0]
+        # initialize compartments 
+        self.I[0] = np.array(params['I0']) # infected 
+        self.V[0] = (self.vaccine_efficacy)*(N*params['vax_prop']) # fully protected 
+        # initially susceptible are total pop - infected - fully protected via vaccination
+        self.S[0] = np.maximum(N - self.I[0] - self.V[0], 0) 
 
         # Current step tracker
         self.current_step = 0
@@ -202,7 +185,7 @@ class MetapopSEIR:
         Returns
         -------
         dict:
-            Keys are: "dS, dE, dI, dR, dS_unvax_out, dE_unvax_out, dI_unvax_out",
+            Keys are: "dS, dE, dI, dR",
             Values are the quantities at time `self.current_step`.
 
         """
@@ -210,31 +193,22 @@ class MetapopSEIR:
         dt = self.dt
 
         force_of_infection = self.total_contacts * dt * \
-                             (self.beta * self.I_unvax[t, ix_pop] + self.beta_vax * self.I_vax[t, ix_pop]) / self.N[ix_pop]
-        force_of_infection_vaccinated = \
-            force_of_infection * (1 - self.vaccine_efficacy)
+                             (self.beta * self.I[t, ix_pop]) / self.N[ix_pop]
 
-        dS_unvax_out = self.get_compartment_transition(force_of_infection, self.S_unvax[t, ix_pop])
-        dE_unvax_out = self.get_compartment_transition(self.sigma * dt, self.E_unvax[t, ix_pop])
-        dI_unvax_out = self.get_compartment_transition(self.gamma * dt, self.I_unvax[t, ix_pop])
-        dS_vax_out = self.get_compartment_transition(force_of_infection_vaccinated, self.S_vax[t, ix_pop])
-        dE_vax_out = self.get_compartment_transition(self.sigma_vax * dt, self.E_vax[t, ix_pop])
-        dI_vax_out = self.get_compartment_transition(self.gamma_vax * dt, self.I_vax[t, ix_pop])
+        dS_out = self.get_compartment_transition(force_of_infection, self.S[t, ix_pop])
+        dE_out = self.get_compartment_transition(self.sigma * dt, self.E[t, ix_pop])
+        dI_out = self.get_compartment_transition(self.gamma * dt, self.I[t, ix_pop])
+        
 
-        dS = -dS_unvax_out
-        dE = dS_unvax_out - dE_unvax_out
-        dI = dE_unvax_out - dI_unvax_out
-        dR = dI_unvax_out
-        dS_vax = -dS_vax_out
-        dE_vax = dS_vax_out - dE_vax_out
-        dI_vax = dE_vax_out - dI_vax_out
-        dR_vax = dI_vax_out
+        dS = -dS_out
+        dE = dS_out - dE_out
+        dI = dE_out - dI_out
+        dR = dI_out
+        
 
         updates_dict = {
-            "dS_unvax": dS, "dE_unvax": dE, "dI_unvax": dI, "dR_unvax": dR,
-            "dS_vax": dS_vax, "dE_vax": dE_vax, "dI_vax": dI_vax, "dR_vax": dR_vax,
-            "dS_unvax_out": dS_unvax_out, "dE_unvax_out": dE_unvax_out, "dI_unvax_out": dI_unvax_out,
-            "dS_vax_out": dS_vax_out, "dE_vax_out": dE_vax_out, "dI_vax_out": dI_vax_out,
+            "dS": dS, "dE": dE, "dI": dI, "dR": dR,
+            "dS_out": dS_out, "dE_out": dE_out, "dI_out": dI_out,
         }
 
         return updates_dict
@@ -250,33 +224,25 @@ class MetapopSEIR:
             current_step = self.current_step
 
             # Creates view of same array in memory, NOT a copy
-            S_unvax, E_unvax, I_unvax, R_unvax, S_vax, E_vax, I_vax, R_vax = self.S_unvax, self.E_unvax, self.I_unvax, self.R_unvax, \
-                                             self.S_vax, self.E_vax, self.I_vax, self.R_vax
-            S_unvax_to_E_unvax, S_vax_to_E_vax = self.S_unvax_to_E_unvax, self.S_vax_to_E_vax
+            S, E, I, R, V = self.S, self.E, self.I, self.R, self.V
+            S_to_E = self.S_to_E
             if self.save_all_transitions:
-                E_unvax_to_I_unvax, I_unvax_to_R_unvax, E_vax_to_I_vax, I_vax_to_R_vax = \
-                    self.E_unvax_to_I_unvax, self.I_unvax_to_R_unvax, self.E_vax_to_I_vax, self.I_vax_to_R_vax
+                E_to_I, I_to_R,  = self.E_to_I, self.I_to_R
 
             # Update compartments using Euler's method
-            S_unvax[current_step + 1, ix_pop] = S_unvax[current_step, ix_pop] + updates["dS_unvax"]
-            E_unvax[current_step + 1, ix_pop] = E_unvax[current_step, ix_pop] + updates["dE_unvax"]
-            I_unvax[current_step + 1, ix_pop] = I_unvax[current_step, ix_pop] + updates["dI_unvax"]
-            R_unvax[current_step + 1, ix_pop] = R_unvax[current_step, ix_pop] + updates["dR_unvax"]
-            S_vax[current_step + 1, ix_pop] = S_vax[self.current_step, ix_pop] + updates["dS_vax"]
-            E_vax[current_step + 1, ix_pop] = E_vax[current_step, ix_pop] + updates["dE_vax"]
-            I_vax[current_step + 1, ix_pop] = I_vax[current_step, ix_pop] + updates["dI_vax"]
-            R_vax[current_step + 1, ix_pop] = R_vax[current_step, ix_pop] + updates["dR_vax"]
-
-            S_unvax_to_E_unvax[current_step + 1, ix_pop] = updates["dS_unvax_out"]
-            S_vax_to_E_vax[current_step + 1, ix_pop] = updates["dS_vax_out"]
+            S[current_step + 1, ix_pop] = S[current_step, ix_pop] + updates["dS"]
+            E[current_step + 1, ix_pop] = E[current_step, ix_pop] + updates["dE"]
+            I[current_step + 1, ix_pop] = I[current_step, ix_pop] + updates["dI"]
+            R[current_step + 1, ix_pop] = R[current_step, ix_pop] + updates["dR"]
+            V[current_step + 1, ix_pop] = V[current_step, ix_pop]
+            
+            S_to_E[current_step + 1, ix_pop] = updates["dS_out"]
 
             # Also update transition variables history
             if self.save_all_transitions:
-                E_unvax_to_I_unvax[current_step + 1, ix_pop] = updates["dE_unvax_out"]
-                I_unvax_to_R_unvax[current_step + 1, ix_pop] = updates["dI_unvax_out"]
-                E_vax_to_I_vax[current_step + 1, ix_pop] = updates["dE_vax_out"]
-                I_vax_to_R_vax[current_step + 1, ix_pop] = updates["dI_vax_out"]
-
+                E_to_I[current_step + 1, ix_pop] = updates["dE_out"]
+                I_to_R[current_step + 1, ix_pop] = updates["dI_out"]
+                
         self.current_step += 1
         return True
 
@@ -287,37 +253,24 @@ class MetapopSEIR:
 
     def clear(self):
 
-        self.S_unvax = np.zeros((self.n_steps, self.n_pop))
-        self.E_unvax = np.zeros((self.n_steps, self.n_pop))
-        self.I_unvax = np.zeros((self.n_steps, self.n_pop))
-        self.R_unvax = np.zeros((self.n_steps, self.n_pop))
-        self.S_vax = np.zeros((self.n_steps, self.n_pop))
-        self.E_vax = np.zeros((self.n_steps, self.n_pop))
-        self.I_vax = np.zeros((self.n_steps, self.n_pop))
-        self.R_vax = np.zeros((self.n_steps, self.n_pop))
-
-        self.S_unvax_to_E_unvax = np.zeros((self.n_steps, self.n_pop))
-        self.S_vax_to_E_vax = np.zeros((self.n_steps, self.n_pop))
+        self.S = np.zeros((self.n_steps, self.n_pop))
+        self.E = np.zeros((self.n_steps, self.n_pop))
+        self.I = np.zeros((self.n_steps, self.n_pop))
+        self.R = np.zeros((self.n_steps, self.n_pop))
+        self.V = np.zeros((self.n_steps, self.n_pop)) 
+    
+        self.S_to_E = np.zeros((self.n_steps, self.n_pop))
 
         if self.save_all_transitions:
-            self.E_unvax_to_I_unvax = np.zeros((self.n_steps, self.n_pop))
-            self.I_unvax_to_R_unvax = np.zeros((self.n_steps, self.n_pop))
-            self.E_vax_to_I_vax = np.zeros((self.n_steps, self.n_pop))
-            self.I_vax_to_R_vax = np.zeros((self.n_steps, self.n_pop))
-
+            self.E_to_I = np.zeros((self.n_steps, self.n_pop))
+            self.I_to_R = np.zeros((self.n_steps, self.n_pop))
+            
         params = self.params
         N = self.N
 
-        self.I_unvax[0] = np.array(params['I0'])
-        self.S_vax[0] = [
-            int(self.N[i_pop] * params['vax_prop'][i_pop])
-            for i_pop in range(self.n_pop)
-        ]
-        self.S_unvax[0] = [
-            min(self.S_unvax[0, i_pop], self.N[i_pop] - self.I_unvax[0, i_pop])
-            for i_pop in range(self.n_pop)
-        ]
-        self.S_unvax[0] = self.N - self.I_unvax[0] - self.S_vax[0]
+        self.I[0] = np.array(params['I0'])
+        self.V[0] = (self.vaccine_efficacy)*(N*params['vax_prop'])
+        self.S[0] = np.maximum(N - self.I[0] - self.V[0], 0) 
 
         self.current_step = 0
 
@@ -329,18 +282,11 @@ class MetapopSEIR:
 
         for pop in range(self.n_pop):
             ax = axes[pop]
-            vaccinated_linestyle = 'dashed'
             ax.plot(self.t, self.S[:, pop], label='Susceptible', color='blue')
             ax.plot(self.t, self.E[:, pop], label='Exposed', color='orange')
             ax.plot(self.t, self.I[:, pop], label='Infectious', color='red')
             ax.plot(self.t, self.R[:, pop], label='Recovered', color='green')
-            ax.plot(self.t, self.S_vax[:, pop], label='Vaccinated', color='blue', linestyle=vaccinated_linestyle)
-            ax.plot(self.t, self.E_vax[:, pop], label='Vaccinated Exposed', color='orange',
-                    linestyle=vaccinated_linestyle)
-            ax.plot(self.t, self.I_vax[:, pop], label='Vaccinated Infectious', color='red',
-                    linestyle=vaccinated_linestyle)
-            ax.plot(self.t, self.R_vax[:, pop], label='Vaccinated Recovered', color='green',
-                    linestyle=vaccinated_linestyle)
+            ax.plot(self.t, self.V[:, pop], label='Vaccinated (protected)', color='purple', linestyle='dashed')
             ax.set_xlabel('Time (days)')
             ax.set_ylabel('Number of individuals')
             ax.set_title(f'Population {pop + 1} SEPIR Dynamics')
